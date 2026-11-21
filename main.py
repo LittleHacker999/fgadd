@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Repack X Auto-Importer v7.5
+Repack X Auto-Importer v7.6
 ===========================
-- No RAWG. FitGirl data only for FitGirl, GOG data only for GOG.
-- FitGirl: only imports releases that HAVE download links.
-- FitGirl and GOG imported separately (same game can have both entries).
-- Dedup by slug: site all-slugs + namespaced local state + in-cycle set.
-- Cycle aborts if site slug list can't be loaded.
-- All fields safely converted (no type crashes).
+Fixes from v7.5:
+- No more 'list' object has no attribute 'get' (safe dict access everywhere)
+- Title-based dedup (source-specific: FitGirl checks FitGirl entries, GOG checks GOG entries)
+- Screenshots: only import URLs ending with image extensions (.jpg .png .webp etc)
+- Description: HTML stripped, lists joined as paragraphs
+- Repacker: always explicitly "FitGirl" or "GOG", logged on create
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 APP_NAME = "Repack X Auto-Importer"
-VERSION = "7.5"
+VERSION = "7.6"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +46,8 @@ _HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif")
 
 
 def polite_pause(lo: float = 1.5, hi: float = 4.0) -> None:
@@ -103,7 +105,7 @@ STATE_FILE = os.environ.get("IMPORTED_STATE_FILE", "imported_slugs.json")
 NO_LINKS_RECHECK = int(os.environ.get("NO_LINKS_RECHECK_SECONDS", "21600"))
 MAX_FAILURES = int(os.environ.get("MAX_FAILURES_PER_CYCLE", "3"))
 
-log.info("%s v%s (no RAWG)", APP_NAME, VERSION)
+log.info("%s v%s", APP_NAME, VERSION)
 log.info("site=%s fitgirl=%s gog=%s", SITE_URL, FITGIRL_API, GOG_SCRAPE)
 log.info("fitgirl_limit=%d gog_limit=%d interval=%ds", FITGIRL_LIMIT, GOG_LIMIT, INTERVAL)
 if not ADMIN_SECRET:
@@ -142,9 +144,15 @@ def post_json(url: str, payload: dict, timeout: int = 90) -> tuple[int, Any]:
         return -1, str(e)
 
 
-# ─── Safe type conversion ────────────────────────────────────────────────────
+# ─── Safe type helpers ───────────────────────────────────────────────────────
+
+def safe_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Safe dict access — returns default if obj is not a dict."""
+    return obj.get(key, default) if isinstance(obj, dict) else default
+
 
 def safe_str(val: Any, default: str = "") -> str:
+    """Convert ANY value to a safe string."""
     if val is None:
         return default
     if isinstance(val, str):
@@ -159,14 +167,18 @@ def safe_str(val: Any, default: str = "") -> str:
                 parts.append(s)
         return ", ".join(parts)
     if isinstance(val, dict):
-        for k in ("name", "title", "value", "text", "label"):
-            if val.get(k):
-                return safe_str(val[k], default)
+        for k in ("name", "title", "value", "text", "label", "url", "image", "href", "src"):
+            v = val.get(k)
+            if v and isinstance(v, (str, int, float)):
+                return str(v)
+            if v:
+                return safe_str(v, default)
         return default
     return str(val) if val else default
 
 
 def safe_str_list(val: Any) -> list[str]:
+    """Extract a list of clean strings from any value (flattens nested lists)."""
     if val is None:
         return []
     if isinstance(val, str):
@@ -175,9 +187,12 @@ def safe_str_list(val: Any) -> list[str]:
     if isinstance(val, (list, tuple)):
         out = []
         for item in val:
-            s = safe_str(item, "").strip()
-            if s:
-                out.append(s)
+            if isinstance(item, (list, tuple)):
+                out.extend(safe_str_list(item))
+            else:
+                s = safe_str(item, "").strip()
+                if s:
+                    out.append(s)
         return out
     s = safe_str(val, "").strip()
     return [s] if s else []
@@ -207,6 +222,108 @@ def clean_game_title(title: Any) -> str:
     t = t.replace("_", " ")
     t = re.sub(r"\s+", " ", t).strip()
     return t.capitalize() if t else "Unknown"
+
+
+def clean_description(text: Any) -> str:
+    """Strip HTML, handle lists as paragraphs, normalize whitespace."""
+    if isinstance(text, (list, tuple)):
+        parts = [clean_description(item) for item in text]
+        return "\n\n".join(p for p in parts if p)
+    s = safe_str(text, "")
+    # Convert block-level HTML to newlines
+    s = re.sub(r"</(p|div|h[1-6]|li|tr|blockquote)[^>]*>", "\n\n", s, flags=re.I)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<li[^>]*>", "\n• ", s, flags=re.I)
+    # Strip remaining HTML tags
+    s = re.sub(r"<[^>]+>", "", s)
+    # Decode common HTML entities
+    for old, new in [
+        ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+        ("&#39;", "'"), ("&nbsp;", " "), ("&hellip;", "..."),
+        ("&mdash;", "\u2014"), ("&ndash;", "\u2013"),
+    ]:
+        s = s.replace(old, new)
+    # Normalize whitespace but preserve line breaks
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    return s.strip()
+
+
+def _extract_url(item: Any) -> str:
+    """Extract a URL string from various formats (str, dict with url/image keys)."""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        for k in ("url", "image", "src", "href", "link", "full", "large"):
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def filter_image_urls(urls: Any) -> list[str]:
+    """Keep only URLs that end with image file extensions."""
+    if urls is None:
+        return []
+    items = urls if isinstance(urls, (list, tuple)) else [urls]
+    result = []
+    for item in items:
+        raw = _extract_url(item)
+        clean = safe_url(raw)
+        if not clean:
+            continue
+        path = clean.lower().split("?")[0].split("#")[0]
+        if any(path.endswith(ext) for ext in IMAGE_EXTS):
+            result.append(clean)
+    return result
+
+
+# ─── Title-based dedup keys ──────────────────────────────────────────────────
+
+def _title_to_key(title: Any) -> str:
+    """Normalize game title to alphanumeric-only lowercase for dedup."""
+    t = safe_str(title, "").strip().lower()
+    t = re.sub(r"\s*\((?:fitgirl|gog|repack|fitgirl repack|gog repack)\)\s*$", "", t, flags=re.I)
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def _slug_to_key(slug: str) -> str:
+    """Normalize slug to alphanumeric-only lowercase for dedup."""
+    s = norm_slug(slug)
+    s = re.sub(r"^(gog|fg)[-:]", "", s)
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def _build_fg_title_keys(slugs: set[str], state: set[str]) -> set[str]:
+    """Title keys for FitGirl entries only (slug NOT starting with gog-)."""
+    keys = set()
+    for s in slugs:
+        if not s.startswith("gog-"):
+            k = _slug_to_key(s)
+            if k:
+                keys.add(k)
+    for s in state:
+        if s.startswith("fg:"):
+            k = _slug_to_key(s[3:])
+            if k:
+                keys.add(k)
+    return keys
+
+
+def _build_gog_title_keys(slugs: set[str], state: set[str]) -> set[str]:
+    """Title keys for GOG entries only (slug starting with gog-)."""
+    keys = set()
+    for s in slugs:
+        if s.startswith("gog-"):
+            k = _slug_to_key(s)
+            if k:
+                keys.add(k)
+    for s in state:
+        if s.startswith("gog:"):
+            k = _slug_to_key(s[4:])
+            if k:
+                keys.add(k)
+    return keys
 
 
 # ─── Local state ─────────────────────────────────────────────────────────────
@@ -263,8 +380,8 @@ def _collect_links(obj: Any, out: list[str]) -> None:
 
 def has_download_links(detail: dict) -> bool:
     links: list[str] = []
-    _collect_links(detail.get("downloadMirrors"), links)
-    _collect_links(detail.get("torrents"), links)
+    _collect_links(safe_get(detail, "downloadMirrors"), links)
+    _collect_links(safe_get(detail, "torrents"), links)
     return len(links) > 0
 
 
@@ -277,7 +394,7 @@ def fg_latest(page: int = 1) -> list[dict]:
     if isinstance(data, list):
         return [d for d in data if isinstance(d, dict)]
     if isinstance(data, dict):
-        results = data.get("results") or data.get("data") or data.get("games") or []
+        results = safe_get(data, "results") or safe_get(data, "data") or safe_get(data, "games") or []
         return [d for d in results if isinstance(d, dict)]
     return []
 
@@ -289,20 +406,49 @@ def fg_detail(slug: str) -> dict | None:
 
 # ─── GOG APIs ───────────────────────────────────────────────────────────────
 
+def _extract_gog_names(items: Any) -> list[str]:
+    """Extract display names from GOG Catalog genres/tags (handles dicts, pairs, strings)."""
+    if not isinstance(items, (list, tuple)):
+        return []
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            n = safe_str(safe_get(item, "name") or safe_get(item, "title") or safe_get(item, "label") or "").strip()
+            if n:
+                out.append(n)
+        elif isinstance(item, (list, tuple)):
+            # [slug, "Name"] pair — take last element as display name
+            if len(item) >= 2:
+                n = safe_str(item[-1]).strip()
+                if n:
+                    out.append(n)
+            elif len(item) == 1:
+                n = safe_str(item[0]).strip()
+                if n:
+                    out.append(n)
+        elif isinstance(item, str):
+            s = item.strip()
+            if s:
+                out.append(s)
+    return out
+
+
 def gog_catalog_info(title: str) -> dict:
     url = f"{GOG_CATALOG_API}?query={urllib.parse.quote(title)}&limit=1"
     data = http_get(url, timeout=30)
     polite_pause(1.0, 2.5)
     if not isinstance(data, dict):
         return {}
-    products = data.get("products") or []
-    if not products:
+    products = safe_get(data, "products") or []
+    if not isinstance(products, (list, tuple)) or not products:
         return {}
     p = products[0]
+    if not isinstance(p, dict):
+        return {}
     return {
-        "cover": safe_url(p.get("coverVertical") or p.get("cover")),
-        "genres": safe_str_list(p.get("genres")),
-        "tags": safe_str_list(p.get("tags")),
+        "cover": safe_url(safe_get(p, "coverVertical") or safe_get(p, "cover")),
+        "genres": _extract_gog_names(safe_get(p, "genres")),
+        "tags": _extract_gog_names(safe_get(p, "tags")),
     }
 
 
@@ -311,13 +457,31 @@ def gog_sysreqs(gog_id: int) -> dict:
     polite_pause(1.0, 2.5)
     if not isinstance(data, dict):
         return {}
-    embedded = data.get("_embedded", {})
-    supported = embedded.get("supportedOperatingSystems", {}).get("_embedded", {})
-    reqs = supported.get("requirements", {}).get("_embedded", {}).get("systemRequirements", [])
+    # Navigate nested _embedded structure safely
+    emb = safe_get(data, "_embedded")
+    if not isinstance(emb, dict):
+        return {}
+    sup = safe_get(emb, "supportedOperatingSystems")
+    if not isinstance(sup, dict):
+        return {}
+    sup_emb = safe_get(sup, "_embedded")
+    if not isinstance(sup_emb, dict):
+        return {}
+    req_wrap = safe_get(sup_emb, "requirements")
+    if not isinstance(req_wrap, dict):
+        return {}
+    req_emb = safe_get(req_wrap, "_embedded")
+    if not isinstance(req_emb, dict):
+        return {}
+    reqs = safe_get(req_emb, "systemRequirements") or []
+    if not isinstance(reqs, (list, tuple)):
+        return {}
     out: dict[str, dict[str, str]] = {}
     for entry in reqs:
-        n = safe_str(entry.get("name", "")).strip()
-        v = safe_str(entry.get("value", "")).strip()
+        if not isinstance(entry, dict):
+            continue
+        n = safe_str(safe_get(entry, "name", "")).strip()
+        v = safe_str(safe_get(entry, "value", "")).strip()
         if n and v:
             out[n] = {"recommended": v}
     return out
@@ -330,7 +494,7 @@ def gog_all_games() -> list[dict]:
     data = http_get(url, timeout=30)
     if not isinstance(data, dict):
         return []
-    games = data.get("games") or []
+    games = safe_get(data, "games") or []
     return [g for g in games if isinstance(g, dict)]
 
 
@@ -340,10 +504,13 @@ def fetch_existing_slugs(base: str) -> set[str] | None:
     data = http_get(f"{base}/api/games/all-slugs", timeout=45)
     if data is None:
         return None
-    items = data if isinstance(data, list) else (
-        data.get("slugs") or data.get("data") or data.get("games") or data.get("results") or []
-        if isinstance(data, dict) else []
-    )
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = (safe_get(data, "slugs") or safe_get(data, "data") or
+                 safe_get(data, "games") or safe_get(data, "results") or [])
+    else:
+        items = []
     if isinstance(items, dict):
         items = list(items.values()) if all(isinstance(v, str) for v in items.values()) else list(items.keys())
     slugs: set[str] = set()
@@ -351,7 +518,7 @@ def fetch_existing_slugs(base: str) -> set[str] | None:
         if isinstance(it, str):
             slugs.add(norm_slug(it))
         elif isinstance(it, dict):
-            s = safe_str(it.get("slug", "")).strip().lower()
+            s = safe_str(safe_get(it, "slug", "")).strip().lower()
             if s:
                 slugs.add(s)
     return slugs if slugs else None
@@ -361,95 +528,103 @@ def fetch_existing_slugs(base: str) -> set[str] | None:
 
 def create_game(payload: dict) -> tuple[bool, str]:
     if DRY:
-        log.info("[dry-run] %s", json.dumps(payload, ensure_ascii=False)[:400])
+        log.info("[dry-run] %s", json.dumps(payload, ensure_ascii=False)[:500])
         return True, "dry-run"
     url = f"{SITE_URL}/api/games/admin?secret={urllib.parse.quote(ADMIN_SECRET)}"
     code, body = post_json(url, payload)
     if code in (200, 201):
-        log.info("  ✓ created: %s", payload.get("title"))
+        log.info("  ✓ created: %s | repacker=%s | slug=%s",
+                 payload.get("title"), payload.get("repacker"), payload.get("slug"))
         return True, "created"
     if code == 409:
         log.info("  - already exists on site: %s", payload.get("title"))
         return True, "duplicate"
-    log.error("  ✗ create failed %s -> %s (slug=%s): %s",
-              code, payload.get("title"), payload.get("slug"), str(body)[:400])
+    log.error("  ✗ create failed %s -> %s | slug=%s | repacker=%s | body: %s",
+              code, payload.get("title"), payload.get("slug"),
+              payload.get("repacker"), str(body)[:400])
     return False, f"error_{code}"
 
 
 # ─── Payload builders ───────────────────────────────────────────────────────
 
-def base_payload(title, download_url, slug, repacker, size_original, size_repack,
+def base_payload(*, title, download_url, slug, repacker, size_original, size_repack,
                  categories, description, cover_url, screenshots, system_requirements) -> dict:
     return {
         "title": safe_str(title, "Unknown"),
         "download_url": safe_str(download_url, ""),
         "slug": safe_str(slug, ""),
-        "repacker": safe_str(repacker, ""),
+        "repacker": safe_str(repacker, "Unknown"),
         "size_original": safe_str(size_original, "Unknown"),
         "size_repack": safe_str(size_repack, "Unknown"),
-        "categories": [safe_str(c, "").strip() for c in categories if safe_str(c, "").strip()],
-        "description": compact(description),
+        "categories": [safe_str(c, "").strip() for c in (categories or []) if safe_str(c, "").strip()],
+        "description": clean_description(description),
         "cover_url": safe_url(cover_url),
-        "screenshot_urls": [safe_url(s) for s in screenshots if safe_url(s)],
+        "screenshot_urls": filter_image_urls(screenshots),
         "system_requirements": system_requirements if isinstance(system_requirements, dict) else {},
-        "featured": False, "trending": False, "is_published": True,
+        "featured": False,
+        "trending": False,
+        "is_published": True,
     }
 
 
 def _extract_categories(detail: dict) -> list[str]:
     cats: list[str] = []
-    cat = detail.get("category")
+    cat = safe_get(detail, "category")
     if isinstance(cat, str):
         s = cat.strip()
         if s and s.lower() not in ("", "none", "other"):
             cats.append(s)
     elif isinstance(cat, dict):
-        n = safe_str(cat.get("name") or cat.get("title") or "").strip()
+        n = safe_str(safe_get(cat, "name") or safe_get(cat, "title") or "").strip()
         if n and n.lower() not in ("none", "other"):
             cats.append(n)
     for key in ("genres", "tags"):
-        for s in safe_str_list(detail.get(key)):
+        for s in safe_str_list(safe_get(detail, key)):
             if s and s.lower() not in ("none", "other") and s not in cats:
                 cats.append(s)
     return cats
 
 
 def build_fitgirl_payload(detail: dict) -> dict:
-    slug = safe_str(detail.get("slug", "")).strip()
-    clean = clean_game_title(detail.get("title", slug))
+    slug = safe_str(safe_get(detail, "slug", "")).strip()
+    raw_title = safe_str(safe_get(detail, "title", slug))
+    clean = clean_game_title(raw_title)
     return base_payload(
         title=f"{clean} (Fitgirl Repack)",
         download_url=f"{DOWNLOAD_BASE}/fg-{slug}",
         slug=slug,
         repacker="FitGirl",
-        size_original=detail.get("originalSize") or "Unknown",
-        size_repack=detail.get("repackSize") or "Unknown",
+        size_original=safe_get(detail, "originalSize") or "Unknown",
+        size_repack=safe_get(detail, "repackSize") or "Unknown",
         categories=_extract_categories(detail),
-        description=detail.get("gameDescription", ""),
-        cover_url=detail.get("cover"),
-        screenshots=safe_str_list(detail.get("screenshots")),
+        description=safe_get(detail, "gameDescription", ""),
+        cover_url=safe_get(detail, "cover"),
+        screenshots=safe_get(detail, "screenshots"),
         system_requirements={},
     )
 
 
 def build_gog_payload(game: dict, catalog: dict, sysreq: dict) -> dict:
-    gog_id = game.get("id")
-    gog_slug = safe_str(game.get("slug", "")).strip() or safe_str(gog_id)
+    gog_id = safe_get(game, "id")
+    gog_slug = safe_str(safe_get(game, "slug", "")).strip() or safe_str(gog_id)
     slug = f"gog-{gog_slug}"
-    clean = clean_game_title(game.get("title", ""))
-    cats = list(dict.fromkeys(catalog.get("genres", []) + catalog.get("tags", [])))
+    raw_title = safe_str(safe_get(game, "title", ""))
+    clean = clean_game_title(raw_title)
+    cats = list(dict.fromkeys(
+        safe_get(catalog, "genres", []) + safe_get(catalog, "tags", [])
+    ))
     cats = [c for c in cats if c and c.lower() not in ("other", "none")]
     return base_payload(
         title=f"{clean} (GOG Repack)",
         download_url=f"{DOWNLOAD_BASE}/gog-{gog_id}",
         slug=slug,
         repacker="GOG",
-        size_original=game.get("size_original") or "Unknown",
-        size_repack=game.get("size") or "Unknown",
+        size_original=safe_get(game, "size_original") or "Unknown",
+        size_repack=safe_get(game, "size") or "Unknown",
         categories=cats,
-        description=game.get("description", ""),
-        cover_url=catalog.get("cover", ""),
-        screenshots=safe_str_list(game.get("screenshots")),
+        description=safe_get(game, "description", ""),
+        cover_url=safe_get(catalog, "cover", ""),
+        screenshots=safe_get(game, "screenshots"),
         system_requirements=sysreq,
     )
 
@@ -460,8 +635,8 @@ NO_LINKS_SEEN: dict[str, float] = {}
 STATS: dict[str, Any] = {"last_cycle": None, "last_result": None}
 
 
-def import_fitgirl(site: set[str], state: set[str]) -> dict:
-    imported = skipped_no_links = failures = 0
+def import_fitgirl(site: set[str], state: set[str], fg_title_keys: set[str]) -> dict:
+    imported = skipped_no_links = skipped_title = failures = 0
     items = fg_latest(1)
     log.info("[fitgirl] page 1: %d releases", len(items))
     processed: set[str] = set()
@@ -469,7 +644,7 @@ def import_fitgirl(site: set[str], state: set[str]) -> dict:
     for item in items:
         if imported >= FITGIRL_LIMIT or failures >= MAX_FAILURES:
             break
-        slug = safe_str(item.get("slug", "")).strip()
+        slug = safe_str(safe_get(item, "slug", "")).strip()
         key = norm_slug(slug)
         if not key or key in processed:
             continue
@@ -479,6 +654,13 @@ def import_fitgirl(site: set[str], state: set[str]) -> dict:
 
         last = NO_LINKS_SEEN.get(key)
         if last and time.time() - last < NO_LINKS_RECHECK:
+            continue
+
+        # Quick title check from list item (if title is available)
+        list_title = safe_str(safe_get(item, "title", "")).strip()
+        if list_title and _title_to_key(list_title) in fg_title_keys:
+            skipped_title += 1
+            log.info("[fitgirl] skip (title already on site): %s", slug)
             continue
 
         polite_pause(1.5, 3.0)
@@ -493,7 +675,14 @@ def import_fitgirl(site: set[str], state: set[str]) -> dict:
             log.info("[fitgirl] skip (no download links): %s", slug)
             continue
 
-        real_slug = safe_str(detail.get("slug", "")).strip() or slug
+        # Title check with full detail title
+        detail_title = safe_str(safe_get(detail, "title", slug)).strip()
+        if detail_title and _title_to_key(detail_title) in fg_title_keys:
+            skipped_title += 1
+            log.info("[fitgirl] skip (title already on site): %s -> %s", slug, detail_title)
+            continue
+
+        real_slug = safe_str(safe_get(detail, "slug", "")).strip() or slug
         real_key = norm_slug(real_slug)
         if real_key in site or f"fg:{real_key}" in state:
             continue
@@ -506,6 +695,9 @@ def import_fitgirl(site: set[str], state: set[str]) -> dict:
             continue
         site.add(real_key)
         site.add(key)
+        tk = _title_to_key(detail_title or real_slug)
+        if tk:
+            fg_title_keys.add(tk)
         if status != "dry-run":
             state.add(f"fg:{real_key}")
             save_state(state)
@@ -513,15 +705,16 @@ def import_fitgirl(site: set[str], state: set[str]) -> dict:
         if status in ("created", "dry-run"):
             imported += 1
         polite_pause_long(CREATE_DELAY, CREATE_DELAY + 3)
-    return {"imported": imported, "skipped_no_links": skipped_no_links, "failures": failures}
+    return {"imported": imported, "skipped_no_links": skipped_no_links,
+            "skipped_title": skipped_title, "failures": failures}
 
 
-def import_gog(site: set[str], state: set[str]) -> dict:
-    imported = failures = 0
+def import_gog(site: set[str], state: set[str], gog_title_keys: set[str]) -> dict:
+    imported = skipped_title = failures = 0
     all_games = gog_all_games()
     if not all_games:
         log.info("[gog] no games found")
-        return {"imported": 0, "failures": 0}
+        return {"imported": 0, "skipped_title": 0, "failures": 0}
 
     gog_on_site = {s for s in site if s.startswith("gog-")}
     backlog = len(all_games) - len(gog_on_site)
@@ -535,31 +728,46 @@ def import_gog(site: set[str], state: set[str]) -> dict:
     for game in all_games:
         if imported >= GOG_LIMIT or failures >= MAX_FAILURES:
             break
-        gog_slug = f"gog-{safe_str(game.get('slug', '')).strip() or safe_str(game.get('id', ''))}"
-        key = norm_slug(gog_slug)
-        if key in seen:
-            continue
-        seen.add(key)
-        if key in site or f"gog:{key}" in state:
-            continue
+        try:
+            gog_slug = f"gog-{safe_str(safe_get(game, 'slug', '')).strip() or safe_str(safe_get(game, 'id', ''))}"
+            key = norm_slug(gog_slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in site or f"gog:{key}" in state:
+                continue
 
-        title = safe_str(game.get("title", "")).strip()
-        log.info("[gog] importing: %s", title)
-        polite_pause(1.5, 3.0)
-        catalog = gog_catalog_info(title)
-        sysreq = gog_sysreqs(game.get("id", 0))
-        ok, status = create_game(build_gog_payload(game, catalog, sysreq))
-        if not ok:
+            title = safe_str(safe_get(game, "title", "")).strip()
+            tk = _title_to_key(title)
+
+            # Title-based dedup (GOG entries only — a FitGirl entry with same title does NOT block)
+            if tk and tk in gog_title_keys:
+                skipped_title += 1
+                log.info("[gog] skip (title already on site): %s", title)
+                continue
+
+            log.info("[gog] importing: %s", title)
+            polite_pause(1.5, 3.0)
+            catalog = gog_catalog_info(title)
+            sysreq = gog_sysreqs(safe_get(game, "id", 0))
+            ok, status = create_game(build_gog_payload(game, catalog, sysreq))
+            if not ok:
+                failures += 1
+                continue
+            site.add(key)
+            if tk:
+                gog_title_keys.add(tk)
+            if status != "dry-run":
+                state.add(f"gog:{key}")
+                save_state(state)
+            if status in ("created", "dry-run"):
+                imported += 1
+            polite_pause_long(CREATE_DELAY, CREATE_DELAY + 3)
+        except Exception as e:
+            log.error("[gog] error processing game: %s", e)
             failures += 1
             continue
-        site.add(key)
-        if status != "dry-run":
-            state.add(f"gog:{key}")
-            save_state(state)
-        if status in ("created", "dry-run"):
-            imported += 1
-        polite_pause_long(CREATE_DELAY, CREATE_DELAY + 3)
-    return {"imported": imported, "failures": failures}
+    return {"imported": imported, "skipped_title": skipped_title, "failures": failures}
 
 
 def run_cycle() -> dict:
@@ -570,17 +778,21 @@ def run_cycle() -> dict:
         return {"error": "slugs_unavailable"}
 
     state = load_state()
+    fg_title_keys = _build_fg_title_keys(site, state)
+    gog_title_keys = _build_gog_title_keys(site, state)
     gog_n = sum(1 for s in site if s.startswith("gog-"))
-    log.info("site slugs: %d (fitgirl=%d gog=%d) | local state: %d",
-             len(site), len(site) - gog_n, gog_n, len(state))
+    log.info("site slugs: %d (fitgirl=%d gog=%d) | state: %d | title keys: fg=%d gog=%d",
+             len(site), len(site) - gog_n, gog_n, len(state),
+             len(fg_title_keys), len(gog_title_keys))
 
-    fg = import_fitgirl(site, state)
-    gog = import_gog(site, state)
+    fg = import_fitgirl(site, state, fg_title_keys)
+    gog = import_gog(site, state, gog_title_keys)
     result = {"fitgirl": fg, "gog": gog}
     STATS["last_cycle"] = time.strftime("%Y-%m-%d %H:%M:%S")
     STATS["last_result"] = result
-    log.info("── cycle done: fitgirl=%d (no-links skipped=%d) gog=%d ──",
-             fg["imported"], fg["skipped_no_links"], gog["imported"])
+    log.info("── cycle done: fitgirl=%d (no-links=%d title-skip=%d) gog=%d (title-skip=%d) ──",
+             fg["imported"], fg["skipped_no_links"], fg["skipped_title"],
+             gog["imported"], gog["skipped_title"])
     return result
 
 
