@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Repack X Auto-Importer v7.4
+Repack X Auto-Importer v7.5
 ===========================
-Fixes: 'list' object has no attribute 'strip' crash.
-All API fields are now safely converted to strings regardless of type.
+- No RAWG. FitGirl data only for FitGirl, GOG data only for GOG.
+- FitGirl: only imports releases that HAVE download links.
+- FitGirl and GOG imported separately (same game can have both entries).
+- Dedup by slug: site all-slugs + namespaced local state + in-cycle set.
+- Cycle aborts if site slug list can't be loaded.
+- All fields safely converted (no type crashes).
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 APP_NAME = "Repack X Auto-Importer"
-VERSION = "7.4"
+VERSION = "7.5"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,8 +84,6 @@ ARGS = parse_args()
 SITE_URL = (_first_env("REPACK_X_SITE_URL") or "https://repackx.apps.mistral.run").rstrip("/")
 DOWNLOAD_BASE = (_first_env("REPACK_X_DOWNLOAD_BASE") or "https://repack-x-database.vercel.app").rstrip("/")
 FITGIRL_API = (_first_env("FITGIRL_API_BASE_URL") or "https://fitgirl-api-5rbz.onrender.com").rstrip("/")
-RAWG_API = (_first_env("RAWG_API_BASE_URL") or "https://api.rawg.io").rstrip("/")
-RAWG_KEY = (_first_env("RAWG_API_KEY") or "").strip()
 GOG_SCRAPE = (_first_env("GOG_SCRAPE_API_URL") or "https://repackx-gscrape.onrender.com").rstrip("/")
 GOG_SCRAPE_KEY = (_first_env("GOG_SCRAPE_API_KEY") or "@Jithula2009").strip()
 ADMIN_SECRET = _first_env("REPACK_X_ADMIN_SECRET", "ADMIN_SECRET", default="") or ""
@@ -101,7 +103,7 @@ STATE_FILE = os.environ.get("IMPORTED_STATE_FILE", "imported_slugs.json")
 NO_LINKS_RECHECK = int(os.environ.get("NO_LINKS_RECHECK_SECONDS", "21600"))
 MAX_FAILURES = int(os.environ.get("MAX_FAILURES_PER_CYCLE", "3"))
 
-log.info("%s v%s", APP_NAME, VERSION)
+log.info("%s v%s (no RAWG)", APP_NAME, VERSION)
 log.info("site=%s fitgirl=%s gog=%s", SITE_URL, FITGIRL_API, GOG_SCRAPE)
 log.info("fitgirl_limit=%d gog_limit=%d interval=%ds", FITGIRL_LIMIT, GOG_LIMIT, INTERVAL)
 if not ADMIN_SECRET:
@@ -140,17 +142,14 @@ def post_json(url: str, payload: dict, timeout: int = 90) -> tuple[int, Any]:
         return -1, str(e)
 
 
-# ─── Safe type conversion (the fix) ─────────────────────────────────────────
+# ─── Safe type conversion ────────────────────────────────────────────────────
 
 def safe_str(val: Any, default: str = "") -> str:
-    """Convert ANY value to a safe string. Lists, dicts, None, numbers all work."""
     if val is None:
         return default
     if isinstance(val, str):
         return val
-    if isinstance(val, bool):
-        return str(val)
-    if isinstance(val, (int, float)):
+    if isinstance(val, (bool, int, float)):
         return str(val)
     if isinstance(val, (list, tuple)):
         parts = []
@@ -168,7 +167,6 @@ def safe_str(val: Any, default: str = "") -> str:
 
 
 def safe_str_list(val: Any) -> list[str]:
-    """Extract a list of clean strings from any value."""
     if val is None:
         return []
     if isinstance(val, str):
@@ -181,15 +179,11 @@ def safe_str_list(val: Any) -> list[str]:
             if s:
                 out.append(s)
         return out
-    if isinstance(val, dict):
-        s = safe_str(val, "").strip()
-        return [s] if s else []
     s = safe_str(val, "").strip()
     return [s] if s else []
 
 
 def safe_url(val: Any) -> str:
-    """Extract a URL string safely."""
     s = safe_str(val, "").strip()
     return s if s.lower().startswith(("http://", "https://", "magnet:")) else ""
 
@@ -215,7 +209,7 @@ def clean_game_title(title: Any) -> str:
     return t.capitalize() if t else "Unknown"
 
 
-# ─── Local state (namespaced) ───────────────────────────────────────────────
+# ─── Local state ─────────────────────────────────────────────────────────────
 
 _state_lock = threading.Lock()
 
@@ -340,45 +334,6 @@ def gog_all_games() -> list[dict]:
     return [g for g in games if isinstance(g, dict)]
 
 
-# ─── RAWG (GOG only) ────────────────────────────────────────────────────────
-
-def _rawg_url(path: str, extra: str = "") -> str:
-    url = f"{RAWG_API}{path}"
-    params = []
-    if extra:
-        params.append(extra)
-    if RAWG_KEY:
-        params.append(f"key={urllib.parse.quote(RAWG_KEY)}")
-    return url + ("?" + "&".join(params) if params else "")
-
-
-def rawg_enrich(title: str) -> dict:
-    short = re.sub(r"\s*\((?:GOG|Fitgirl|FitGirl|Repack)\).*$", "", safe_str(title, "")).strip()
-    data = http_get(_rawg_url("/games", f"search={urllib.parse.quote(short)}&page_size=1"), timeout=30)
-    polite_pause(1.0, 2.5)
-    results = data.get("results") if isinstance(data, dict) else None
-    if not results or not isinstance(results[0], dict):
-        return {"description": "", "screenshots": []}
-    rid = results[0].get("id")
-    rslug = safe_str(results[0].get("slug", "")).strip()
-    desc = ""
-    if rid:
-        d = http_get(_rawg_url(f"/games/{rid}"), timeout=30)
-        polite_pause(1.0, 2.5)
-        if isinstance(d, dict):
-            desc = d.get("description_raw", "")
-    shots: list[str] = []
-    if rslug:
-        s = http_get(_rawg_url(f"/games/{rslug}/screenshots"), timeout=30)
-        polite_pause(1.0, 2.5)
-        if isinstance(s, dict):
-            for r in (s.get("results") or []):
-                img = safe_url(r.get("image", "")) if isinstance(r, dict) else ""
-                if img:
-                    shots.append(img)
-    return {"description": compact(desc), "screenshots": shots}
-
-
 # ─── Dedup: site slugs ───────────────────────────────────────────────────────
 
 def fetch_existing_slugs(base: str) -> set[str] | None:
@@ -421,7 +376,7 @@ def create_game(payload: dict) -> tuple[bool, str]:
     return False, f"error_{code}"
 
 
-# ─── Payload builders (all fields safely converted) ─────────────────────────
+# ─── Payload builders ───────────────────────────────────────────────────────
 
 def base_payload(title, download_url, slug, repacker, size_original, size_repack,
                  categories, description, cover_url, screenshots, system_requirements) -> dict:
@@ -443,7 +398,6 @@ def base_payload(title, download_url, slug, repacker, size_original, size_repack
 
 def _extract_categories(detail: dict) -> list[str]:
     cats: list[str] = []
-    # category field
     cat = detail.get("category")
     if isinstance(cat, str):
         s = cat.strip()
@@ -453,7 +407,6 @@ def _extract_categories(detail: dict) -> list[str]:
         n = safe_str(cat.get("name") or cat.get("title") or "").strip()
         if n and n.lower() not in ("none", "other"):
             cats.append(n)
-    # genres and tags
     for key in ("genres", "tags"):
         for s in safe_str_list(detail.get(key)):
             if s and s.lower() not in ("none", "other") and s not in cats:
@@ -479,7 +432,7 @@ def build_fitgirl_payload(detail: dict) -> dict:
     )
 
 
-def build_gog_payload(game: dict, catalog: dict, rawg: dict, sysreq: dict) -> dict:
+def build_gog_payload(game: dict, catalog: dict, sysreq: dict) -> dict:
     gog_id = game.get("id")
     gog_slug = safe_str(game.get("slug", "")).strip() or safe_str(gog_id)
     slug = f"gog-{gog_slug}"
@@ -494,9 +447,9 @@ def build_gog_payload(game: dict, catalog: dict, rawg: dict, sysreq: dict) -> di
         size_original=game.get("size_original") or "Unknown",
         size_repack=game.get("size") or "Unknown",
         categories=cats,
-        description=rawg.get("description", ""),
+        description=game.get("description", ""),
         cover_url=catalog.get("cover", ""),
-        screenshots=rawg.get("screenshots", []),
+        screenshots=safe_str_list(game.get("screenshots")),
         system_requirements=sysreq,
     )
 
@@ -594,9 +547,8 @@ def import_gog(site: set[str], state: set[str]) -> dict:
         log.info("[gog] importing: %s", title)
         polite_pause(1.5, 3.0)
         catalog = gog_catalog_info(title)
-        rawg = rawg_enrich(title)
         sysreq = gog_sysreqs(game.get("id", 0))
-        ok, status = create_game(build_gog_payload(game, catalog, rawg, sysreq))
+        ok, status = create_game(build_gog_payload(game, catalog, sysreq))
         if not ok:
             failures += 1
             continue
